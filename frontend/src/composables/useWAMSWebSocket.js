@@ -130,6 +130,20 @@ export function useWAMSWebSocket() {
 
   const pmuStates = reactive({})
   const angleDiffHistory = ref([])
+  const oscillationAlerts = ref([])
+  const controlActions = ref([])
+  const activeAlerts = reactive({})
+
+  const oscillationCallbacks = []
+  const controlCallbacks = []
+
+  function onOscillationAlert(callback) {
+    oscillationCallbacks.push(callback)
+  }
+
+  function onControlAction(callback) {
+    controlCallbacks.push(callback)
+  }
 
   const processMessage = (data) => {
     try {
@@ -189,6 +203,45 @@ export function useWAMSWebSocket() {
           }
           angleDiffHistory.value = trimmed
         }
+      }
+
+      if (msg.type === 'oscAlert' && msg.oscAlert) {
+        const alert = msg.oscAlert
+        oscillationAlerts.value.push(alert)
+        if (oscillationAlerts.value.length > 100) {
+          oscillationAlerts.value = oscillationAlerts.value.slice(-100)
+        }
+        activeAlerts[alert.sectionName] = alert
+
+        try {
+          oscillationCallbacks.forEach(cb => cb(alert))
+        } catch (e) {
+          console.error('Error in oscillation callback:', e)
+        }
+
+        console.warn('[OSC-ALERT]', alert.severity, alert.sectionName,
+          'f=' + alert.dominantMode.frequency.toFixed(3) + 'Hz',
+          'ζ=' + alert.dominantMode.dampingRatio.toFixed(4),
+          'conf=' + (alert.confidenceLevel * 100).toFixed(0) + '%')
+      }
+
+      if (msg.type === 'controlAction' && msg.controlAction) {
+        const action = msg.controlAction
+        controlActions.value.push(action)
+        if (controlActions.value.length > 50) {
+          controlActions.value = controlActions.value.slice(-50)
+        }
+
+        try {
+          controlCallbacks.forEach(cb => cb(action))
+        } catch (e) {
+          console.error('Error in control callback:', e)
+        }
+
+        console.error('[CONTROL-ACTION]', action.actionType,
+          'trip=' + action.tripAmountMW.toFixed(0) + 'MW',
+          'brake=' + action.brakeAmountMW.toFixed(0) + 'MW',
+          'targets=' + action.targetStations.join(','))
       }
     } catch (e) {
       dataQuality.invalidMessages++
@@ -262,8 +315,13 @@ export function useWAMSWebSocket() {
     isConnected,
     pmuStates,
     angleDiffHistory,
+    oscillationAlerts,
+    controlActions,
+    activeAlerts,
     dataQuality,
     connect,
-    disconnect
+    disconnect,
+    onOscillationAlert,
+    onControlAction
   }
 }

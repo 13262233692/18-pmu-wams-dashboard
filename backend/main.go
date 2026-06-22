@@ -7,6 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 	"wams-dashboard/internal/buffer"
+	"wams-dashboard/internal/control"
+	"wams-dashboard/internal/detector"
 	"wams-dashboard/internal/filter"
 	"wams-dashboard/internal/middleware"
 	"wams-dashboard/internal/models"
@@ -20,6 +22,11 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+)
+
+var (
+	oscSystem      *detector.LowFreqOscillationSystem
+	ctrlExecutor   *control.ControlExecutor
 )
 
 func main() {
@@ -44,10 +51,27 @@ func main() {
 	app.Use(logger.New())
 	app.Use(middleware.PanicRecovery())
 
-	phasorBuffer := buffer.NewLockFreeRingBuffer(10000)
+	phasorBuffer := buffer.NewLockFreeRingBuffer(50000)
 	swrlsFilter := filter.NewSWRLSFilter(50, 0.98)
 	wsHub := wshub.NewHub()
 	middleware.SafeGo("ws-hub", wsHub.Run)
+
+	alertChan := make(chan *models.OscillationAlert, 100)
+	controlChan := make(chan *models.ControlAction, 100)
+
+	ctrlExecutor = control.NewControlExecutor(
+		alertChan,
+		controlChan,
+		wsHub.BroadcastControl,
+	)
+	ctrlExecutor.Start()
+
+	oscSystem = detector.NewLowFreqOscillationSystem(
+		wsHub.GetSections(),
+		alertChan,
+		controlChan,
+	)
+	middleware.SafeGo("osc-detector", oscSystem.RunAnalysisLoop)
 
 	app.Get("/ws", fiberws.New(func(c *fiberws.Conn) {
 		wsHub.HandleConnection(c)
@@ -77,8 +101,27 @@ func main() {
 		})
 	})
 
-	parsedChan := make(chan *models.PhasorMeasurement, 10000)
-	filteredChan := make(chan *models.PhasorMeasurement, 10000)
+	app.Get("/api/oscillation/status", func(c *fiber.Ctx) error {
+		statuses := oscSystem.GetAllStatus()
+		snapshots := oscSystem.GetSnapshots()
+		return c.JSON(fiber.Map{
+			"statuses":  statuses,
+			"snapshots": snapshots,
+		})
+	})
+
+	app.Get("/api/control/status", func(c *fiber.Ctx) error {
+		ctrlStatus := ctrlExecutor.GetStatus()
+		actions := ctrlExecutor.GetExecutedActions()
+		return c.JSON(fiber.Map{
+			"executor": ctrlStatus,
+			"actions":  actions,
+			"count":    len(actions),
+		})
+	})
+
+	parsedChan := make(chan *models.PhasorMeasurement, 50000)
+	filteredChan := make(chan *models.PhasorMeasurement, 50000)
 
 	filterProc := &middleware.PanicProtectedProcessor{Name: "swrls-filter"}
 	middleware.SafeGo("filter-pipeline", func() {
@@ -96,6 +139,7 @@ func main() {
 			bufferProc.Process(func() {
 				phasorBuffer.Push(pm)
 				wsHub.Broadcast(pm)
+				oscSystem.IngestPMU(pm)
 			})
 		}
 	})
@@ -138,6 +182,9 @@ func main() {
 	log.Printf("  WebSocket -> ws://localhost:8080/ws")
 	log.Printf("  PMU UDP   -> %s", udpAddr)
 	log.Printf("  PMU TCP   -> %s", tcpAddr)
+	log.Printf("  Osc Detector: 6 sections, Prony order=10, window=400 samples")
+	log.Printf("  Control Executor: max 10 actions/hr, cooldown 30s")
+	log.Printf("  Simulated Oscillations: 3 negative-damping modes scheduled")
 
 	middleware.SafeGo("http-server", func() {
 		if err := app.Listen(":8080"); err != nil {
@@ -149,7 +196,7 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	shutdown(app, phasorBuffer, udpListener, tcpListener, pmuSim, parsedChan, filteredChan)
+	shutdown(app, phasorBuffer, udpListener, tcpListener, pmuSim, oscSystem, ctrlExecutor, parsedChan, filteredChan, alertChan, controlChan)
 }
 
 func shutdown(components ...interface{}) {
@@ -166,7 +213,15 @@ func shutdown(components ...interface{}) {
 			c.Close()
 		case *simulator.PMUSimulator:
 			c.Stop()
+		case *detector.LowFreqOscillationSystem:
+			c.Stop()
+		case *control.ControlExecutor:
+			c.Stop()
 		case chan *models.PhasorMeasurement:
+			close(c)
+		case chan *models.OscillationAlert:
+			close(c)
+		case chan *models.ControlAction:
 			close(c)
 		}
 	}

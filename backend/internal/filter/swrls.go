@@ -47,13 +47,17 @@ func (f *SWRLSFilter) Apply(pm *models.PhasorMeasurement) *models.PhasorMeasurem
 	f.mu.Unlock()
 
 	result := &models.PhasorMeasurement{
-		PMUID:       pm.PMUID,
-		StationName: pm.StationName,
-		Timestamp:   pm.Timestamp,
-		UnixNano:    pm.UnixNano,
-		SequenceNum: pm.SequenceNum,
-		Status:      pm.Status,
-		Filtered:    true,
+		PMUID:        pm.PMUID,
+		IDCode:       pm.IDCode,
+		StationName:  pm.StationName,
+		Timestamp:    pm.Timestamp,
+		UnixNano:     pm.UnixNano,
+		SequenceNum:  pm.SequenceNum,
+		Status:       pm.Status,
+		Filtered:     true,
+		ActivePower:  pm.ActivePower,
+		ReactivePower: pm.ReactivePower,
+		VoltageAngle: pm.VoltageAngle,
 	}
 
 	for i := 0; i < 3; i++ {

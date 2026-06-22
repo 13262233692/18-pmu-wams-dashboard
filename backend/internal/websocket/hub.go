@@ -19,6 +19,9 @@ type Hub struct {
 	mu            sync.RWMutex
 	pmuStates     map[string]*models.PhasorMeasurement
 	sections      []models.TransmissionSection
+
+	oscAlertChan   chan *models.OscillationAlert
+	controlChan    chan *models.ControlAction
 }
 
 func NewHub() *Hub {
@@ -28,15 +31,36 @@ func NewHub() *Hub {
 		register:   make(chan *fiberws.Conn),
 		unregister: make(chan *fiberws.Conn),
 		pmuStates:  make(map[string]*models.PhasorMeasurement),
+		oscAlertChan: make(chan *models.OscillationAlert, 100),
+		controlChan:  make(chan *models.ControlAction, 100),
 		sections: []models.TransmissionSection{
 			{Name: "华东-华北断面", FromStation: "华东-换流站A", ToStation: "华北-变电站B"},
-			{Name: "华中-华东断面", FromStation: "华中-变电站C", ToStation: "华东-换流站A"},
-			{Name: "西北-华中断面", FromStation: "西北-变电站D", ToStation: "华中-变电站C"},
-			{Name: "西南-华中断面", FromStation: "西南-换流站E", ToStation: "华中-变电站C"},
-			{Name: "华南-华东断面", FromStation: "华南-变电站F", ToStation: "华东-换流站A"},
-			{Name: "东北-华北断面", FromStation: "东北-变电站G", ToStation: "华北-变电站B"},
+			{Name: "华中-华东断面", FromStation: "华中-枢纽站C", ToStation: "华东-换流站A"},
+			{Name: "西北-华中断面", FromStation: "西北-火电厂E", ToStation: "华中-枢纽站C"},
+			{Name: "西南-华中断面", FromStation: "西南-水电厂D", ToStation: "华中-枢纽站C"},
+			{Name: "华南-华东断面", FromStation: "华南-核电G",   ToStation: "华东-换流站A"},
+			{Name: "东北-华北断面", FromStation: "东北-风电场F", ToStation: "华北-变电站B"},
 		},
 	}
+}
+
+func (h *Hub) GetOscAlertChan() chan<- *models.OscillationAlert {
+	return h.oscAlertChan
+}
+
+func (h *Hub) GetControlChan() chan<- *models.ControlAction {
+	return h.controlChan
+}
+
+func (h *Hub) GetSections() []models.TransmissionSection {
+	return h.sections
+}
+
+func (h *Hub) BroadcastControl(action *models.ControlAction) {
+	h.sendToClients(models.WSMessage{
+		Type:          "controlAction",
+		ControlAction: action,
+	})
 }
 
 func (h *Hub) Run() {
@@ -59,8 +83,36 @@ func (h *Hub) Run() {
 
 		case pm := <-h.broadcast:
 			h.processAndBroadcast(pm)
+
+		case alert := <-h.oscAlertChan:
+			h.broadcastOscAlert(alert)
+
+		case action := <-h.controlChan:
+			h.broadcastControlAction(action)
 		}
 	}
+}
+
+func (h *Hub) broadcastOscAlert(alert *models.OscillationAlert) {
+	log.Printf("[WS-HUB] Broadcasting oscillation alert: %s section=%s severity=%s f=%.3fHz ζ=%.4f",
+		alert.AlertType, alert.SectionName, alert.Severity,
+		alert.DominantMode.Frequency, alert.DominantMode.DampingRatio)
+
+	h.sendToClients(models.WSMessage{
+		Type:     "oscAlert",
+		OscAlert: alert,
+	})
+}
+
+func (h *Hub) broadcastControlAction(action *models.ControlAction) {
+	log.Printf("[WS-HUB] Broadcasting control action: %s type=%s priority=%d trip=%.1fMW brake=%.1fMW",
+		action.ActionID, action.ActionType, action.Priority,
+		action.TripAmountMW, action.BrakeAmountMW)
+
+	h.sendToClients(models.WSMessage{
+		Type:          "controlAction",
+		ControlAction: action,
+	})
 }
 
 func (h *Hub) processAndBroadcast(pm *models.PhasorMeasurement) {
@@ -188,10 +240,6 @@ func (h *Hub) HandleConnection(c *fiberws.Conn) {
 			break
 		}
 	}
-}
-
-func (h *Hub) GetSections() []models.TransmissionSection {
-	return h.sections
 }
 
 func sanitizeFloat(v float64) float64 {
