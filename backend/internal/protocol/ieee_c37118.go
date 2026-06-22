@@ -3,7 +3,10 @@ package protocol
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"log"
 	"math"
+	"sync/atomic"
 	"time"
 	"wams-dashboard/internal/models"
 )
@@ -21,10 +24,36 @@ const (
 	AnalogFloat32     = 0x0002
 	FreqInt16         = 0x0000
 	FreqFloat32       = 0x0004
+
+	MinFrameSize      = 16
+	MaxFrameSize      = 65535
+	MaxPhasorCount    = 24
+	PhasorSizeFloat64 = 16
+	MinPhasorBytes    = 8
 )
+
+var (
+	ErrFrameTooShort     = errors.New("frame too short")
+	ErrFrameTooLarge     = errors.New("frame exceeds maximum allowed size")
+	ErrInvalidSync       = errors.New("invalid sync word")
+	ErrInsufficientBytes = errors.New("insufficient bytes for payload")
+	ErrInvalidPhasorCnt  = errors.New("invalid phasor count")
+	ErrBoundsViolation   = errors.New("slice bounds violation prevented")
+
+	totalPanicPrevented uint64
+)
+
+type ParserStats struct {
+	TotalFrames     uint64
+	ValidFrames     uint64
+	CorruptedFrames uint64
+	BoundsPrevented uint64
+	OverSizeFrames  uint64
+}
 
 type IEEEParser struct {
 	stationNames map[string]string
+	stats        ParserStats
 }
 
 func NewIEEEParser() *IEEEParser {
@@ -34,47 +63,161 @@ func NewIEEEParser() *IEEEParser {
 }
 
 type FrameHeader struct {
-	Sync         uint16
-	Framesize    uint16
-	IDCode       uint16
-	SOC          uint32
-	FracSec      uint32
-	TimeBase     uint32
+	Sync      uint16
+	Framesize uint16
+	IDCode    uint16
+	SOC       uint32
+	FracSec   uint32
+	TimeBase  uint32
 }
 
-func (p *IEEEParser) Parse(data []byte) ([]*models.PhasorMeasurement, error) {
-	if len(data) < 16 {
-		return nil, errors.New("data too short for IEEE C37.118 frame")
+func (p *IEEEParser) GetStats() ParserStats {
+	return ParserStats{
+		TotalFrames:     atomic.LoadUint64(&p.stats.TotalFrames),
+		ValidFrames:     atomic.LoadUint64(&p.stats.ValidFrames),
+		CorruptedFrames: atomic.LoadUint64(&p.stats.CorruptedFrames),
+		BoundsPrevented: atomic.LoadUint64(&p.stats.BoundsPrevented),
+		OverSizeFrames:  atomic.LoadUint64(&p.stats.OverSizeFrames),
+	}
+}
+
+func safeReadUint16(data []byte, offset int) (uint16, error) {
+	if offset < 0 || offset+2 > len(data) {
+		atomic.AddUint64(&totalPanicPrevented, 1)
+		return 0, fmt.Errorf("%w: read uint16 at offset %d, len=%d", ErrBoundsViolation, offset, len(data))
+	}
+	return binary.BigEndian.Uint16(data[offset : offset+2]), nil
+}
+
+func safeReadUint32(data []byte, offset int) (uint32, error) {
+	if offset < 0 || offset+4 > len(data) {
+		atomic.AddUint64(&totalPanicPrevented, 1)
+		return 0, fmt.Errorf("%w: read uint32 at offset %d, len=%d", ErrBoundsViolation, offset, len(data))
+	}
+	return binary.BigEndian.Uint32(data[offset : offset+4]), nil
+}
+
+func safeReadUint64(data []byte, offset int) (uint64, error) {
+	if offset < 0 || offset+8 > len(data) {
+		atomic.AddUint64(&totalPanicPrevented, 1)
+		return 0, fmt.Errorf("%w: read uint64 at offset %d, len=%d", ErrBoundsViolation, offset, len(data))
+	}
+	return binary.BigEndian.Uint64(data[offset : offset+8]), nil
+}
+
+func safeSlice(data []byte, start, end int) ([]byte, error) {
+	if start < 0 || end < start || end > len(data) {
+		atomic.AddUint64(&totalPanicPrevented, 1)
+		return nil, fmt.Errorf("%w: slice [%d:%d), len=%d", ErrBoundsViolation, start, end, len(data))
+	}
+	return data[start:end], nil
+}
+
+func (p *IEEEParser) Parse(data []byte) (results []*models.PhasorMeasurement, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			atomic.AddUint64(&p.stats.CorruptedFrames, 1)
+			log.Printf("PANIC RECOVERED in Parse: %v", r)
+			err = fmt.Errorf("parser panic recovered: %v", r)
+			results = nil
+		}
+	}()
+
+	dataLen := len(data)
+	if dataLen < MinFrameSize {
+		atomic.AddUint64(&p.stats.CorruptedFrames, 1)
+		return nil, fmt.Errorf("%w: %d bytes", ErrFrameTooShort, dataLen)
 	}
 
 	offset := 0
-	var results []*models.PhasorMeasurement
+	results = make([]*models.PhasorMeasurement, 0, 8)
+	consecutiveBadFrames := 0
 
-	for offset+16 <= len(data) {
-		sync := binary.BigEndian.Uint16(data[offset : offset+2])
+	for offset < dataLen {
+		remaining := dataLen - offset
+		if remaining < MinFrameSize {
+			break
+		}
+
+		atomic.AddUint64(&p.stats.TotalFrames, 1)
+
+		sync, err := safeReadUint16(data, offset)
+		if err != nil {
+			atomic.AddUint64(&p.stats.BoundsPrevented, 1)
+			offset++
+			consecutiveBadFrames++
+			continue
+		}
+
 		if (sync & 0xFF00) != 0xAA00 {
 			offset++
+			consecutiveBadFrames++
 			continue
 		}
 
-		frameSize := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
-		if frameSize < 16 || offset+frameSize > len(data) {
+		frameSizeU16, err := safeReadUint16(data, offset+2)
+		if err != nil {
+			atomic.AddUint64(&p.stats.BoundsPrevented, 1)
 			offset++
 			continue
 		}
 
-		frameData := data[offset : offset+frameSize]
+		frameSize := int(frameSizeU16)
+		if frameSize < MinFrameSize {
+			atomic.AddUint64(&p.stats.CorruptedFrames, 1)
+			offset++
+			consecutiveBadFrames++
+			continue
+		}
+
+		if frameSize > MaxFrameSize {
+			atomic.AddUint64(&p.stats.OverSizeFrames, 1)
+			atomic.AddUint64(&p.stats.CorruptedFrames, 1)
+			log.Printf("WARNING: Oversized frame detected: %d bytes (max %d), skipping", frameSize, MaxFrameSize)
+			offset++
+			consecutiveBadFrames++
+			continue
+		}
+
+		if offset+frameSize > dataLen {
+			atomic.AddUint64(&p.stats.CorruptedFrames, 1)
+			if consecutiveBadFrames > 100 {
+				log.Printf("WARNING: High frame corruption rate at offset %d, remaining %d bytes, skipping 1 byte", offset, remaining)
+			}
+			offset++
+			consecutiveBadFrames++
+			continue
+		}
+
+		consecutiveBadFrames = 0
+
+		frameData, err := safeSlice(data, offset, offset+frameSize)
+		if err != nil {
+			atomic.AddUint64(&p.stats.BoundsPrevented, 1)
+			offset++
+			continue
+		}
+
 		frameType := (sync & 0x000F)
 
-		switch frameType {
-		case FrameTypeData:
-			pm, err := p.parseDataFrame(frameData)
-			if err == nil {
+		if frameType == FrameTypeData {
+			pm, parseErr := p.parseDataFrameSafe(frameData)
+			if parseErr == nil && pm != nil {
 				results = append(results, pm)
+				atomic.AddUint64(&p.stats.ValidFrames, 1)
+			} else {
+				atomic.AddUint64(&p.stats.CorruptedFrames, 1)
+				if parseErr != nil && errors.Is(parseErr, ErrBoundsViolation) {
+					atomic.AddUint64(&p.stats.BoundsPrevented, 1)
+				}
 			}
 		}
 
 		offset += frameSize
+	}
+
+	if consecutiveBadFrames > 1000 {
+		log.Printf("ALERT: Parser encountered %d consecutive bad frames, possible sync loss", consecutiveBadFrames)
 	}
 
 	if len(results) == 0 {
@@ -84,109 +227,208 @@ func (p *IEEEParser) Parse(data []byte) ([]*models.PhasorMeasurement, error) {
 	return results, nil
 }
 
-func (p *IEEEParser) parseDataFrame(data []byte) (*models.PhasorMeasurement, error) {
-	if len(data) < 28 {
-		return nil, errors.New("data frame too short")
+func (p *IEEEParser) parseDataFrameSafe(data []byte) (pm *models.PhasorMeasurement, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC RECOVERED in parseDataFrameSafe: %v", r)
+			err = fmt.Errorf("data frame parse panic: %v", r)
+			pm = nil
+		}
+	}()
+
+	dataLen := len(data)
+	if dataLen < 28 {
+		return nil, fmt.Errorf("%w: data frame %d bytes", ErrFrameTooShort, dataLen)
 	}
 
-	pm := &models.PhasorMeasurement{
+	pm = &models.PhasorMeasurement{
 		Timestamp: time.Now(),
 		UnixNano:  time.Now().UnixNano(),
 	}
 
 	offset := 0
-	sync := binary.BigEndian.Uint16(data[offset : offset+2])
+
+	sync, err := safeReadUint16(data, offset)
+	if err != nil {
+		return nil, err
+	}
 	offset += 2
 
 	isPolar := (sync & 0x0010) != 0
 
-	_ = binary.BigEndian.Uint16(data[offset : offset+2])
+	_, err = safeReadUint16(data, offset)
+	if err != nil {
+		return nil, err
+	}
 	offset += 2
 
-	pm.IDCode = binary.BigEndian.Uint16(data[offset : offset+2])
+	idCode, err := safeReadUint16(data, offset)
+	if err != nil {
+		return nil, err
+	}
 	offset += 2
+	pm.IDCode = idCode
 
-	pmUID := p.getPMUName(pm.IDCode)
+	pmUID := p.getPMUName(idCode)
 	pm.PMUID = pmUID
 	pm.StationName = pmUID
 
-	soc := binary.BigEndian.Uint32(data[offset : offset+4])
+	soc, err := safeReadUint32(data, offset)
+	if err != nil {
+		return nil, err
+	}
 	offset += 4
 
-	fracSec := binary.BigEndian.Uint32(data[offset : offset+4])
+	fracSec, err := safeReadUint32(data, offset)
+	if err != nil {
+		return nil, err
+	}
 	offset += 4
 
 	timeBase := uint32(1000000)
 	if (fracSec & 0x80000000) != 0 {
 		timeBase = fracSec & 0x00FFFFFF
-		fracSec = binary.BigEndian.Uint32(data[offset : offset+4])
+		if offset+4 > dataLen {
+			return pm, nil
+		}
+		fs, err := safeReadUint32(data, offset)
+		if err != nil {
+			return nil, err
+		}
+		fracSec = fs
 		offset += 4
 	}
 
 	fracSec &= 0x00FFFFFF
-	nanoSec := uint64(fracSec) * uint64(1e9) / uint64(timeBase)
-	pm.Timestamp = time.Unix(int64(soc), int64(nanoSec))
-	pm.UnixNano = pm.Timestamp.UnixNano()
+	if timeBase > 0 {
+		nanoSec := uint64(fracSec) * uint64(1e9) / uint64(timeBase)
+		pm.Timestamp = time.Unix(int64(soc), int64(nanoSec))
+		pm.UnixNano = pm.Timestamp.UnixNano()
+	}
 
-	if offset+4 > len(data) {
+	if offset+4 > dataLen {
 		return pm, nil
 	}
 
-	pm.SequenceNum = binary.BigEndian.Uint32(data[offset : offset+4])
+	seqNum, err := safeReadUint32(data, offset)
+	if err != nil {
+		return nil, err
+	}
+	pm.SequenceNum = seqNum
 	offset += 4
 
-	phasorCount := 3
-	if offset+phasorCount*8+16 > len(data) {
-		phasorCount = (len(data) - offset - 16) / 8
-		if phasorCount < 0 {
-			phasorCount = 0
-		}
+	remaining := dataLen - offset
+	phasorBytesPerChannel := PhasorSizeFloat64
+	maxPossiblePhasors := remaining / phasorBytesPerChannel
+	if maxPossiblePhasors > MaxPhasorCount {
+		maxPossiblePhasors = MaxPhasorCount
 	}
 
-	for i := 0; i < phasorCount && i < 3; i++ {
-		if offset+8 > len(data) {
+	configuredPhasors := 3
+	if configuredPhasors > maxPossiblePhasors {
+		configuredPhasors = maxPossiblePhasors
+	}
+
+	if configuredPhasors < 0 {
+		configuredPhasors = 0
+	}
+
+	for i := 0; i < configuredPhasors && i < 3; i++ {
+		requiredBytes := MinPhasorBytes
+		if isPolar {
+			requiredBytes = PhasorSizeFloat64
+		} else {
+			requiredBytes = PhasorSizeFloat64
+		}
+
+		if offset+requiredBytes > dataLen {
+			log.Printf("WARNING: Truncated phasor at idx %d, need %d bytes, have %d", i, requiredBytes, dataLen-offset)
 			break
 		}
 
 		var phasor models.ComplexPhasor
 		if isPolar {
-			mag := math.Float64frombits(binary.BigEndian.Uint64(data[offset : offset+8]))
-			offset += 8
-			angle := 0.0
-			if offset+8 <= len(data) {
-				angle = math.Float64frombits(binary.BigEndian.Uint64(data[offset : offset+8]))
-				offset += 8
+			magBits, err := safeReadUint64(data, offset)
+			if err != nil {
+				return nil, err
 			}
-			phasor = models.ComplexPhasor{
-				Magnitude: mag,
-				Angle:     angle,
-				Real:      mag * math.Cos(angle),
-				Imag:      mag * math.Sin(angle),
+			mag := math.Float64frombits(magBits)
+			offset += 8
+
+			angleBits, err := safeReadUint64(data, offset)
+			if err != nil {
+				return nil, err
+			}
+			angle := math.Float64frombits(angleBits)
+			offset += 8
+
+			if !math.IsNaN(mag) && !math.IsInf(mag, 0) && !math.IsNaN(angle) && !math.IsInf(angle, 0) {
+				phasor = models.ComplexPhasor{
+					Magnitude: mag,
+					Angle:     angle,
+					Real:      mag * math.Cos(angle),
+					Imag:      mag * math.Sin(angle),
+				}
 			}
 		} else {
-			realPart := math.Float64frombits(binary.BigEndian.Uint64(data[offset : offset+8]))
-			offset += 8
-			imagPart := 0.0
-			if offset+8 <= len(data) {
-				imagPart = math.Float64frombits(binary.BigEndian.Uint64(data[offset : offset+8]))
-				offset += 8
+			realBits, err := safeReadUint64(data, offset)
+			if err != nil {
+				return nil, err
 			}
-			phasor = models.ComplexPhasor{
-				Real:      realPart,
-				Imag:      imagPart,
-				Magnitude: math.Sqrt(realPart*realPart + imagPart*imagPart),
-				Angle:     math.Atan2(imagPart, realPart),
+			realPart := math.Float64frombits(realBits)
+			offset += 8
+
+			imagBits, err := safeReadUint64(data, offset)
+			if err != nil {
+				return nil, err
+			}
+			imagPart := math.Float64frombits(imagBits)
+			offset += 8
+
+			if !math.IsNaN(realPart) && !math.IsInf(realPart, 0) && !math.IsNaN(imagPart) && !math.IsInf(imagPart, 0) {
+				phasor = models.ComplexPhasor{
+					Real:      realPart,
+					Imag:      imagPart,
+					Magnitude: math.Sqrt(realPart*realPart + imagPart*imagPart),
+					Angle:     math.Atan2(imagPart, realPart),
+				}
 			}
 		}
 		pm.PhaseVoltage[i] = phasor
 	}
 
 	for i := 0; i < 3; i++ {
-		if offset+8 > len(data) {
+		if offset+16 > dataLen {
+			realPart := float64(500.0 + float64(i)*20.0)
+			imagPart := float64(float64(i) * 10.0)
+			pm.PhaseCurrent[i] = models.ComplexPhasor{
+				Real:      realPart,
+				Imag:      imagPart,
+				Magnitude: math.Sqrt(realPart*realPart + imagPart*imagPart),
+				Angle:     math.Atan2(imagPart, realPart),
+			}
+			continue
+		}
+
+		realBits, err := safeReadUint64(data, offset)
+		if err != nil {
 			break
 		}
-		realPart := float64(500.0 + float64(i)*20.0)
-		imagPart := float64(float64(i) * 10.0)
+		realPart := math.Float64frombits(realBits)
+		offset += 8
+
+		imagBits, err := safeReadUint64(data, offset)
+		if err != nil {
+			break
+		}
+		imagPart := math.Float64frombits(imagBits)
+		offset += 8
+
+		if math.IsNaN(realPart) || math.IsInf(realPart, 0) || math.IsNaN(imagPart) || math.IsInf(imagPart, 0) {
+			realPart = float64(500.0 + float64(i)*20.0)
+			imagPart = float64(float64(i) * 10.0)
+		}
+
 		pm.PhaseCurrent[i] = models.ComplexPhasor{
 			Real:      realPart,
 			Imag:      imagPart,
@@ -195,16 +437,30 @@ func (p *IEEEParser) parseDataFrame(data []byte) (*models.PhasorMeasurement, err
 		}
 	}
 
-	if offset+16 <= len(data) {
-		realPart := math.Float64frombits(binary.BigEndian.Uint64(data[offset : offset+8]))
+	if offset+16 <= dataLen {
+		realBits, err := safeReadUint64(data, offset)
+		if err != nil {
+			return pm, nil
+		}
+		realPart := math.Float64frombits(realBits)
 		offset += 8
-		imagPart := math.Float64frombits(binary.BigEndian.Uint64(data[offset : offset+8]))
+
+		imagBits, err := safeReadUint64(data, offset)
+		if err != nil {
+			return pm, nil
+		}
+		imagPart := math.Float64frombits(imagBits)
 		offset += 8
-		pm.PositiveSeqV = models.ComplexPhasor{
-			Real:      realPart,
-			Imag:      imagPart,
-			Magnitude: math.Sqrt(realPart*realPart + imagPart*imagPart),
-			Angle:     math.Atan2(imagPart, realPart),
+
+		if !math.IsNaN(realPart) && !math.IsInf(realPart, 0) && !math.IsNaN(imagPart) && !math.IsInf(imagPart, 0) {
+			pm.PositiveSeqV = models.ComplexPhasor{
+				Real:      realPart,
+				Imag:      imagPart,
+				Magnitude: math.Sqrt(realPart*realPart + imagPart*imagPart),
+				Angle:     math.Atan2(imagPart, realPart),
+			}
+		} else {
+			pm.PositiveSeqV = calculatePositiveSequence(pm.PhaseVoltage)
 		}
 	} else {
 		pm.PositiveSeqV = calculatePositiveSequence(pm.PhaseVoltage)
@@ -212,22 +468,45 @@ func (p *IEEEParser) parseDataFrame(data []byte) (*models.PhasorMeasurement, err
 
 	pm.PositiveSeqI = calculatePositiveSequence(pm.PhaseCurrent)
 
-	if offset+8 <= len(data) {
-		pm.Frequency = math.Float64frombits(binary.BigEndian.Uint64(data[offset : offset+8]))
+	if offset+8 <= dataLen {
+		freqBits, err := safeReadUint64(data, offset)
+		if err == nil {
+			freq := math.Float64frombits(freqBits)
+			if !math.IsNaN(freq) && !math.IsInf(freq, 0) && freq > 45 && freq < 55 {
+				pm.Frequency = freq
+			} else {
+				pm.Frequency = 50.0
+			}
+		} else {
+			pm.Frequency = 50.0
+		}
 		offset += 8
 	} else {
 		pm.Frequency = 50.0
 	}
 
-	if offset+8 <= len(data) {
-		pm.ROCOF = math.Float64frombits(binary.BigEndian.Uint64(data[offset : offset+8]))
+	if offset+8 <= dataLen {
+		rocofBits, err := safeReadUint64(data, offset)
+		if err == nil {
+			rocof := math.Float64frombits(rocofBits)
+			if !math.IsNaN(rocof) && !math.IsInf(rocof, 0) && rocof > -10 && rocof < 10 {
+				pm.ROCOF = rocof
+			} else {
+				pm.ROCOF = 0.0
+			}
+		} else {
+			pm.ROCOF = 0.0
+		}
 		offset += 8
 	} else {
 		pm.ROCOF = 0.0
 	}
 
-	if offset+2 <= len(data) {
-		pm.Status = binary.BigEndian.Uint16(data[offset : offset+2])
+	if offset+2 <= dataLen {
+		status, err := safeReadUint16(data, offset)
+		if err == nil {
+			pm.Status = status
+		}
 	}
 
 	return pm, nil
@@ -255,10 +534,34 @@ func calculatePositiveSequence(phase [3]models.ComplexPhasor) models.ComplexPhas
 
 	v1 := (vA + a*vB + a2*vC) / complex(3.0, 0)
 
-	return models.ComplexPhasor{
-		Real:      real(v1),
-		Imag:      imag(v1),
-		Magnitude: math.Sqrt(real(v1)*real(v1) + imag(v1)*imag(v1)),
-		Angle:     math.Atan2(imag(v1), real(v1)),
+	realPart := real(v1)
+	imagPart := imag(v1)
+
+	if math.IsNaN(realPart) || math.IsInf(realPart, 0) {
+		realPart = 0
 	}
+	if math.IsNaN(imagPart) || math.IsInf(imagPart, 0) {
+		imagPart = 0
+	}
+
+	mag := math.Sqrt(realPart*realPart + imagPart*imagPart)
+	if math.IsNaN(mag) || math.IsInf(mag, 0) {
+		mag = 0
+	}
+
+	angle := math.Atan2(imagPart, realPart)
+	if math.IsNaN(angle) || math.IsInf(angle, 0) {
+		angle = 0
+	}
+
+	return models.ComplexPhasor{
+		Real:      realPart,
+		Imag:      imagPart,
+		Magnitude: mag,
+		Angle:     angle,
+	}
+}
+
+func GetTotalPanicPrevented() uint64 {
+	return atomic.LoadUint64(&totalPanicPrevented)
 }

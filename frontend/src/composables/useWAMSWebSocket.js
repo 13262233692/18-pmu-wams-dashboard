@@ -1,6 +1,126 @@
 import { ref, reactive } from 'vue'
 
 const MAX_ANGLE_DIFF_POINTS = 1000
+const MAX_ANGLE_CHANGE = 30
+const MAX_FREQ_CHANGE = 0.5
+const MAX_VOLTAGE_CHANGE = 0.1
+const SLIDING_WINDOW_SIZE = 10
+
+const dataQuality = reactive({
+  totalMessages: 0,
+  invalidMessages: 0,
+  spikeMessages: 0,
+  lastInvalidTime: null
+})
+
+const lastValidValues = reactive({})
+const slidingWindows = reactive({})
+
+function isValidNumber(value) {
+  return typeof value === 'number' &&
+    !isNaN(value) &&
+    isFinite(value)
+}
+
+function validatePhasor(pmu) {
+  if (!pmu || !pmu.pmuId) return false
+
+  const fields = [
+    'positiveSeqVoltageMag', 'positiveSeqVoltageAng',
+    'positiveSeqCurrentMag', 'positiveSeqCurrentAng',
+    'frequency', 'rocof'
+  ]
+
+  for (const field of fields) {
+    if (pmu[field] !== undefined && !isValidNumber(pmu[field])) {
+      return false
+    }
+  }
+
+  if (pmu.positiveSeqVoltageMag < 0 || pmu.positiveSeqVoltageMag > 1000) {
+    return false
+  }
+
+  if (pmu.positiveSeqVoltageAng < -180 || pmu.positiveSeqVoltageAng > 180) {
+    return false
+  }
+
+  if (pmu.frequency < 45 || pmu.frequency > 55) {
+    return false
+  }
+
+  return true
+}
+
+function detectSpike(pmu) {
+  const pmuId = pmu.pmuId
+  const last = lastValidValues[pmuId]
+
+  if (!last) {
+    lastValidValues[pmuId] = { ...pmu }
+    return false
+  }
+
+  const angleDiff = Math.abs(pmu.positiveSeqVoltageAng - last.positiveSeqVoltageAng)
+  const freqDiff = Math.abs(pmu.frequency - last.frequency)
+  const voltageDiff = Math.abs(pmu.positiveSeqVoltageMag - last.positiveSeqVoltageMag) / (last.positiveSeqVoltageMag || 1)
+
+  if (angleDiff > MAX_ANGLE_CHANGE ||
+      freqDiff > MAX_FREQ_CHANGE ||
+      voltageDiff > MAX_VOLTAGE_CHANGE) {
+    return true
+  }
+
+  lastValidValues[pmuId] = { ...pmu }
+  return false
+}
+
+function smoothWithSlidingWindow(pmu) {
+  const pmuId = pmu.pmuId
+
+  if (!slidingWindows[pmuId]) {
+    slidingWindows[pmuId] = []
+  }
+
+  const window = slidingWindows[pmuId]
+  window.push({ ...pmu })
+
+  if (window.length > SLIDING_WINDOW_SIZE) {
+    window.shift()
+  }
+
+  if (window.length < 3) {
+    return pmu
+  }
+
+  const smoothed = { ...pmu }
+
+  smoothed.positiveSeqVoltageMag = window.reduce((sum, p) => sum + p.positiveSeqVoltageMag, 0) / window.length
+  smoothed.positiveSeqVoltageAng = window.reduce((sum, p) => sum + p.positiveSeqVoltageAng, 0) / window.length
+  smoothed.positiveSeqCurrentMag = window.reduce((sum, p) => sum + p.positiveSeqCurrentMag, 0) / window.length
+  smoothed.positiveSeqCurrentAng = window.reduce((sum, p) => sum + p.positiveSeqCurrentAng, 0) / window.length
+  smoothed.frequency = window.reduce((sum, p) => sum + p.frequency, 0) / window.length
+  smoothed.rocof = window.reduce((sum, p) => sum + p.rocof, 0) / window.length
+
+  return smoothed
+}
+
+function validateAngleDiff(diff) {
+  if (!diff || !diff.sectionName) return false
+
+  if (!isValidNumber(diff.angleDifference)) return false
+
+  if (diff.angleDifference < -180 || diff.angleDifference > 180) {
+    return false
+  }
+
+  if (Math.abs(diff.angleDifference) > 90) {
+    dataQuality.spikeMessages++
+    return false
+  }
+
+  return true
+}
 
 export function useWAMSWebSocket() {
   const isConnected = ref(false)
@@ -13,15 +133,37 @@ export function useWAMSWebSocket() {
 
   const processMessage = (data) => {
     try {
+      dataQuality.totalMessages++
+
       const msg = JSON.parse(data)
 
       if (msg.type === 'phasor' && msg.data) {
         const pmu = msg.data
-        pmuStates[pmu.pmuId] = pmu
+
+        if (!validatePhasor(pmu)) {
+          dataQuality.invalidMessages++
+          dataQuality.lastInvalidTime = Date.now()
+          return
+        }
+
+        if (detectSpike(pmu)) {
+          dataQuality.spikeMessages++
+          return
+        }
+
+        const smoothedPmu = smoothWithSlidingWindow(pmu)
+        pmuStates[pmu.pmuId] = smoothedPmu
       }
 
       if (msg.type === 'angleDiff' && msg.angleDiff) {
         const diff = msg.angleDiff
+
+        if (!validateAngleDiff(diff)) {
+          dataQuality.invalidMessages++
+          dataQuality.lastInvalidTime = Date.now()
+          return
+        }
+
         angleDiffHistory.value.push(diff)
 
         if (angleDiffHistory.value.length > MAX_ANGLE_DIFF_POINTS) {
@@ -49,6 +191,8 @@ export function useWAMSWebSocket() {
         }
       }
     } catch (e) {
+      dataQuality.invalidMessages++
+      dataQuality.lastInvalidTime = Date.now()
       console.error('Failed to parse WebSocket message:', e)
     }
   }
@@ -118,6 +262,7 @@ export function useWAMSWebSocket() {
     isConnected,
     pmuStates,
     angleDiffHistory,
+    dataQuality,
     connect,
     disconnect
   }

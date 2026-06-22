@@ -1,8 +1,10 @@
 package buffer
 
 import (
+	"sync"
 	"sync/atomic"
 	"wams-dashboard/internal/models"
+	"wams-dashboard/internal/watchdog"
 )
 
 type LockFreeRingBuffer struct {
@@ -13,11 +15,13 @@ type LockFreeRingBuffer struct {
 	tail      uint32
 	size      uint32
 	pmuLatest map[string]*models.PhasorMeasurement
+	watchdog  *watchdog.BufferWatchdog
+	mu        sync.RWMutex
 }
 
 func NewLockFreeRingBuffer(capacity int) *LockFreeRingBuffer {
 	actualCap := nextPowerOfTwo(uint32(capacity))
-	return &LockFreeRingBuffer{
+	rb := &LockFreeRingBuffer{
 		capacity:  actualCap,
 		mask:      actualCap - 1,
 		data:      make([]*models.PhasorMeasurement, actualCap),
@@ -26,6 +30,17 @@ func NewLockFreeRingBuffer(capacity int) *LockFreeRingBuffer {
 		size:      0,
 		pmuLatest: make(map[string]*models.PhasorMeasurement),
 	}
+
+	wd := watchdog.NewBufferWatchdog("phasor-buffer", int(actualCap), 100000)
+	rb.watchdog = wd
+
+	wd.SetBufferSizeGetter(func() int {
+		return int(atomic.LoadUint32(&rb.size))
+	})
+
+	watchdog.GetWatchdogManager().Register(wd)
+
+	return rb
 }
 
 func nextPowerOfTwo(n uint32) uint32 {
@@ -43,7 +58,14 @@ func nextPowerOfTwo(n uint32) uint32 {
 }
 
 func (rb *LockFreeRingBuffer) Push(pm *models.PhasorMeasurement) {
+	currentSize := int(atomic.LoadUint32(&rb.size))
+	if rb.watchdog != nil && rb.watchdog.ShouldDropPacket(currentSize) {
+		return
+	}
+
+	rb.mu.Lock()
 	rb.pmuLatest[pm.PMUID] = pm
+	rb.mu.Unlock()
 
 	for {
 		head := atomic.LoadUint32(&rb.head)
@@ -67,6 +89,12 @@ func (rb *LockFreeRingBuffer) Push(pm *models.PhasorMeasurement) {
 			atomic.AddUint32(&rb.size, 1)
 			return
 		}
+	}
+}
+
+func (rb *LockFreeRingBuffer) Close() {
+	if rb.watchdog != nil {
+		watchdog.GetWatchdogManager().Unregister(rb.watchdog.Name())
 	}
 }
 
